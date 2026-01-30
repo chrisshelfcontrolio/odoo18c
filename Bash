@@ -1,0 +1,162 @@
+#!/bin/bash
+
+echo "======================================"
+echo "   Odoo 18 Community Full Installer    "
+echo "   Ubuntu 22.04 LTS + Docker + HTTPS   "
+echo "======================================"
+
+# --- CONFIGURATION ---
+ODOO_VERSION=18
+POSTGRES_VERSION=15
+ODOO_PORT=8069
+DOMAIN_NAME=""   # leave empty for no Traefik/HTTPS
+EMAIL_FOR_LETSENCRYPT=""  # required if DOMAIN_NAME is set
+
+ODOO_USER="odoo"
+ODOO_DB="postgres"
+POSTGRES_PASSWORD=$(openssl rand -hex 16)
+ADMIN_PASSWORD=$(openssl rand -hex 12)
+
+INSTALL_TRAEFIK=false
+if [[ -n "$DOMAIN_NAME" ]]; then
+    INSTALL_TRAEFIK=true
+fi
+
+# --- INSTALL DOCKER ---
+echo "Installing Docker..."
+sudo apt update -y
+sudo apt install -y ca-certificates curl gnupg lsb-release
+
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+echo \
+  "deb [arch=$(dpkg --print-architecture) \
+  signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/ubuntu \
+  $(lsb_release -cs) stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+sudo apt update -y
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# --- ENABLE DOCKER WITHOUT SUDO ---
+sudo groupadd docker 2>/dev/null
+sudo usermod -aG docker $USER
+
+echo "Docker installed and configured."
+
+# --- DETECT DOCKER COMPOSE COMMAND ---
+if command -v docker compose >/dev/null 2>&1; then
+    COMPOSE_CMD="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE_CMD="docker-compose"
+else
+    echo "ERROR: Docker Compose not found."
+    exit 1
+fi
+
+echo "Using compose command: $COMPOSE_CMD"
+
+# --- CREATE PROJECT STRUCTURE ---
+mkdir -p odoo18/{addons,config,backups}
+cd odoo18
+
+# --- CREATE ODOO CONFIG ---
+cat <<EOF > config/odoo.conf
+[options]
+addons_path = /mnt/extra-addons
+data_dir = /var/lib/odoo
+admin_passwd = ${ADMIN_PASSWORD}
+EOF
+
+# --- CREATE BACKUP SCRIPT ---
+cat <<'EOF' > backup.sh
+#!/bin/bash
+DATE=$(date +%Y-%m-%d_%H-%M)
+docker exec odoo18-db pg_dump -U odoo postgres > backups/db_$DATE.sql
+docker exec odoo18 tar -czf backups/filestore_$DATE.tar.gz /var/lib/odoo
+EOF
+chmod +x backup.sh
+
+# --- CREATE CRON JOB FOR DAILY BACKUPS ---
+(crontab -l 2>/dev/null; echo "0 3 * * * $(pwd)/backup.sh") | crontab -
+
+# --- CREATE DOCKER-COMPOSE FILE ---
+cat <<EOF > docker-compose.yml
+version: "3.9"
+
+services:
+  db:
+    image: postgres:${POSTGRES_VERSION}
+    container_name: odoo18-db
+    environment:
+      - POSTGRES_DB=${ODOO_DB}
+      - POSTGRES_USER=${ODOO_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    restart: always
+
+  odoo:
+    image: odoo:${ODOO_VERSION}
+    container_name: odoo18
+    depends_on:
+      - db
+    ports:
+      - "${ODOO_PORT}:8069"
+    environment:
+      - HOST=db
+      - USER=${ODOO_USER}
+      - PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - odoo_data:/var/lib/odoo
+      - ./addons:/mnt/extra-addons
+      - ./config:/etc/odoo
+    restart: always
+
+volumes:
+  db_data:
+  odoo_data:
+EOF
+
+# --- START ODOO ---
+echo "Starting Odoo 18..."
+$COMPOSE_CMD up -d
+
+sleep 5
+
+# --- OUTPUT INFORMATION ---
+echo ""
+echo "======================================"
+echo "        Installation Complete          "
+echo "======================================"
+echo "Odoo 18 Community is now running."
+echo ""
+echo "Access URL:"
+echo "  http://localhost:${ODOO_PORT}"
+echo ""
+echo "Database Information:"
+echo "  Host: db"
+echo "  User: ${ODOO_USER}"
+echo "  Password: ${POSTGRES_PASSWORD}"
+echo "  Database: ${ODOO_DB}"
+echo ""
+echo "Admin Password (for first login):"
+echo "  ${ADMIN_PASSWORD}"
+echo ""
+echo "Project Directory: $(pwd)"
+echo "Custom Addons: $(pwd)/addons"
+echo "Config File: $(pwd)/config/odoo.conf"
+echo "Backups: $(pwd)/backups"
+echo ""
+echo "To view logs:"
+echo "  $COMPOSE_CMD logs -f"
+echo ""
+echo "To stop Odoo:"
+echo "  $COMPOSE_CMD down"
+echo ""
+echo "======================================"
+echo "        Enjoy using Odoo 18!          "
+echo "======================================"
